@@ -83,6 +83,9 @@ function displayFavourites() {
 						c.nbEmptyDocks + "</td><td><a class='rmFav' href='javascript:removeFavourite(" + c.id + ")'>remove</a></td></tr>"
 			}
 			favString += "</table>";
+		document.querySelectorAll("form")[0].style.marginTop = 0;
+		} else {
+		document.querySelectorAll("form")[0].style.marginTop = "15%";
 	}
 	document.cookie = "favs=" + ids.join(",");
 	document.getElementById("stationList").innerHTML = favString;
@@ -108,6 +111,11 @@ function displayFavourites() {
 		visibility:hidden;
 		color:rgb(255, 187, 2);
 		text-decoration:none;
+	}
+	form {
+		margin-top: 15%;
+		transition-property: margin-top;
+		transition-duration: 0.5s;
 	}
 	body { background: rgb(22, 86, 135); text-align: center }
 
