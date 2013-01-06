@@ -1,0 +1,150 @@
+<!doctype html>
+<head>
+	<title>BIXI Checker</title>
+<body>
+<script>
+	imageInstalled = {}
+	imgTelus = {}
+	imgAutoShare = {}
+	stations = [];
+	function ShowInfoBulle(v, id, c)
+	{
+		if (c.nbBikes != undefined) {
+			stations.push(c);
+		}
+	}
+	map = {}
+	imgSponsors = {}
+	markersArray = []
+	google = {maps: { LatLng: function () {}, Marker: function() {}, event: { addListener: function () {} } }}
+	
+	var favourites = [];
+
+function stationFromId(id) {
+	for (var i = 0; i < stations.length; i++) {
+		if (stations[i].id == id) {
+			return stations[i];
+		}
+	}
+}
+
+function addFavourite(station) {
+	for (i = 0; i < favourites.length; i++) {
+		if (favourites[i] == station) {
+			break;
+		}
+	}
+	if (i == favourites.length)
+		favourites.push(station);
+}
+
+Array.prototype.remove = function(from, to) {
+	  var rest = this.slice((to || from) + 1 || this.length);
+	    this.length = from < 0 ? this.length + from : from;
+	      return this.push.apply(this, rest);
+      };
+
+function removeFavourite(id) {
+	station = stationFromId(id);
+	for (i = 0; i < favourites.length; i++) {
+		if (favourites[i] == station) {
+			favourites.remove(i);
+			break;
+		}
+	}
+	displayFavourites();
+}
+
+
+
+function addNewFavourite(e) {
+	var c;
+	var id = document.getElementById("stationChooser").value;
+	var i;
+	c = stationFromId(id);
+	addFavourite(c);
+	displayFavourites();
+}
+
+
+
+function displayFavourites() {
+	var favString = ""
+	var ids = []
+	if (favourites.length) {
+
+		favString = "<table align=center cellspacing=20><tr id='heading'><td></td><td># of bikes</td><td># of empty docks</td><td></td></tr>";
+			for (var i = 0; i < favourites.length; i++) {
+				var c = favourites[i];
+				ids.push(c.id);
+				favString += "<tr class=fav><td>" + c.name + "</td><td>" +
+						//document.write(c.id + " " + c.name + " " + c.nbEmptyDocks + " empty - " + c.nbBikes + " bikes<br>");
+						c.nbBikes + "</td><td>" +
+						c.nbEmptyDocks + "</td><td><a class='rmFav' href='javascript:removeFavourite(" + c.id + ")'>remove</a></td></tr>"
+			}
+			favString += "</table>";
+	}
+	document.cookie = "favs=" + ids.join(",");
+	document.getElementById("stationList").innerHTML = favString;
+}
+</script>
+<style>
+	.fav:hover .rmFav:link {
+		visibility:visible;
+	}
+	table: { border:solid }
+	td { text-align:center; font-size: 28pt;
+
+		color: white;
+		font-family: Helvetica,Arial,sans-serif
+	}
+	#heading td {
+		font-size: 14pt;
+		color: rgb(129, 196, 253);
+	}
+	.rmFav:link {
+		font-size: 14pt;
+		vertical-align: middle;
+		visibility:hidden;
+		color:rgb(255, 187, 2);
+		text-decoration:none;
+	}
+	body { background: rgb(22, 86, 135); text-align: center }
+
+</style>
+<script src="https://toronto.bixi.com/maps/statajax"></script>
+<form>
+<script>
+	generateScript(function () {  } );
+	stations.sort(function (a, b) {
+		return a.name > b.name;
+	});
+	document.write("<select id='stationChooser'>");
+	for (var i = 0; i < stations.length; i++) {
+		var c = stations[i];
+		document.write("<option value=" + c.id + " >" + c.name + "</option> ");
+	}
+	document.write("</select>");
+
+</script>
+<input type="button" value="Add Favourite" onclick="addNewFavourite(event)"></input>
+</form>
+<div id="stationList">
+</div>
+<script>
+	var str = document.cookie;
+	str = str.split(";");
+	for (var i = 0; i < str.length; i++) {
+		var s = str[i].split("=");
+		if (s[0] == "favs" && s[1].length > 0) {
+			var favs = s[1].split(",");
+			for (var k = 0; k < favs.length; k++) {
+				addFavourite(stationFromId(favs[k]))
+			}
+			displayFavourites();
+			break;
+		}
+	}
+
+</script>
+</body>
