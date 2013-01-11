@@ -78,7 +78,7 @@ function displayFavourites() {
 			for (var i = 0; i < favourites.length; i++) {
 				var c = favourites[i];
 				ids.push(c.id);
-				favString += "<tr class=fav><td>" + c.name + "</td><td>" +
+				favString += "<tr class=fav><td class='stName'>" + c.name + "</td><td>" +
 						//document.write(c.id + " " + c.name + " " + c.nbEmptyDocks + " empty - " + c.nbBikes + " bikes<br>");
 						c.nbBikes + "</td><td>" +
 						c.nbEmptyDocks + "</td><td><a class='rmFav' href='javascript:removeFavourite(" + c.id + ")'>remove</a></td></tr>"
@@ -96,12 +96,16 @@ function displayFavourites() {
 	.fav:hover .rmFav:link {
 		visibility:visible;
 	}
-	table: { border:solid }
-	td { text-align:center; font-size: 28pt;
+	/*
+	table { border:solid }
+	*/
+	td { text-align:center;
+		font-size: 28pt;
 
 		color: white;
 		font-family: Helvetica,Arial,sans-serif
 	}
+
 	#heading td {
 		font-size: 14pt;
 		color: rgb(129, 196, 253);
@@ -119,6 +123,13 @@ function displayFavourites() {
 		transition-duration: 0.5s;
 	}
 	body { background: rgb(22, 86, 135); text-align: center }
+	@media screen and (max-width : 480px) {
+		td.stName {
+			font-size: 14pt;
+
+		}
+
+	}
 
 </style>
 <script src="https://toronto.bixi.com/maps/statajax"></script>
