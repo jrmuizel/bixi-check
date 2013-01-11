@@ -96,8 +96,8 @@ function displayFavourites() {
 	.fav:hover .rmFav:link {
 		visibility:visible;
 	}
-	/*
-	table { border:solid }
+	
+	/*table { border:solid }
 	*/
 	td { text-align:center;
 		font-size: 28pt;
@@ -124,12 +124,15 @@ function displayFavourites() {
 	}
 	body { background: rgb(22, 86, 135); text-align: center }
 	@media screen and (max-width : 480px) {
+		table {
+			border-spacing: 15px;
+		}
 		td.stName {
 			font-size: 14pt;
 
 		}
 		td {
-			font-size: 24pt;
+			font-size: 22pt;
 		}
 			.rmFav:link {
 		font-size: 13pt;
