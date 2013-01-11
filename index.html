@@ -151,6 +151,14 @@ function displayFavourites() {
 	stations.sort(function (a, b) {
 		return a.name > b.name;
 	});
+	document.addEventListener("visibilitychange", function () {
+		if (!document.hidden) {
+			window.location.reload();
+			//document.getElementById("stationList").innerHTML = "" + (new Date()) +
+			//document.getElementById("stationList").innerHTML;
+		}
+
+	}, false);
 	document.write("<select id='stationChooser'>");
 	for (var i = 0; i < stations.length; i++) {
 		var c = stations[i];
