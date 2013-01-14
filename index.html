@@ -89,7 +89,9 @@ function displayFavourites() {
 		} else {
 		document.querySelectorAll("form")[0].style.marginTop = "15%";
 	}
-	document.cookie = "favs=" + ids.join(",");
+	var future = new Date();
+	future.setFullYear(future.getFullYear()+30);
+	document.cookie = "favs=" + ids.join(",") + ";expires=" + future.toUTCString();
 	document.getElementById("stationList").innerHTML = favString;
 }
 </script>
