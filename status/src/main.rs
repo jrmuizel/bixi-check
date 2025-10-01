@@ -1,10 +1,23 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{sqlite::SqlitePool, sqlite::SqliteConnectOptions};
+use sqlx::{sqlite::SqlitePool, sqlite::SqliteConnectOptions, Row};
 use std::time::Duration;
 use tokio::time;
 use tracing::{error, info, warn};
+use arrow::{
+    array::{Array, ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray},
+    datatypes::{DataType, Field, Schema},
+    record_batch::RecordBatch,
+};
+use parquet::{
+    arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
+    file::properties::WriterProperties,
+};
+use std::fs::File;
+use std::sync::Arc;
+use clap::{Parser, Subcommand};
+use askama::Template;
 
 const API_URL: &str = "https://tor.publicbikesystem.net/ube/gbfs/v1/en/station_status";
 
@@ -62,8 +75,41 @@ struct StationStatusRecord {
     traffic: Option<i32>,
 }
 
+#[derive(Parser)]
+#[command(name = "bixi-status")]
+#[command(about = "Bixi status collector and converter")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    Collect,
+    ToParquet { output: String },
+    Graph {
+        station_id: String,
+        parquet_file: String,
+        output: String,
+        #[arg(long, help = "Number of hours to show (default: 24)")]
+        hours: Option<u32>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Collect => collect_data().await,
+        Commands::ToParquet { output } => convert_to_parquet(&output).await,
+        Commands::Graph { station_id, parquet_file, output, hours } => {
+            generate_station_graph(&station_id, &parquet_file, &output, hours.unwrap_or(24)).await
+        }
+    }
+}
+
+async fn collect_data() -> Result<()> {
     // Initialize logging
     tracing_subscriber::fmt::init();
 
@@ -251,6 +297,266 @@ async fn store_station_record(pool: &SqlitePool, record: &StationStatusRecord) -
     .execute(pool)
     .await?;
 
+    Ok(())
+}
+
+async fn convert_to_parquet(output_path: &str) -> Result<()> {
+    tracing_subscriber::fmt::init();
+    info!("Converting SQLite database to Parquet format with station columns");
+
+    let current_dir = std::env::current_dir()?;
+    let db_path = current_dir.join("bixi_status.db");
+
+    let options = SqliteConnectOptions::new().filename(&db_path);
+    let pool = SqlitePool::connect_with(options).await?;
+
+    // Get all unique station IDs
+    let station_rows = sqlx::query("SELECT DISTINCT station_id FROM station_status_history ORDER BY station_id")
+        .fetch_all(&pool)
+        .await?;
+
+    let station_ids: Vec<String> = station_rows
+        .iter()
+        .map(|row| row.get::<String, _>("station_id"))
+        .collect();
+
+    info!("Found {} unique stations", station_ids.len());
+
+    let schema = create_station_columns_schema(&station_ids);
+    let output_file = File::create(output_path)?;
+    let props = WriterProperties::builder().build();
+    let mut writer = ArrowWriter::try_new(output_file, schema.clone(), Some(props))?;
+
+    // Get distinct timestamps to process one timestamp at a time
+    let timestamp_rows = sqlx::query("SELECT DISTINCT timestamp FROM station_status_history ORDER BY timestamp")
+        .fetch_all(&pool)
+        .await?;
+
+    let total_timestamps = timestamp_rows.len();
+    info!("Processing {} unique timestamps", total_timestamps);
+
+    for (idx, timestamp_row) in timestamp_rows.iter().enumerate() {
+        let timestamp: String = timestamp_row.get("timestamp");
+
+        if idx % 1000 == 0 {
+            info!("Processing timestamp {} of {} ({})", idx + 1, total_timestamps, timestamp);
+        }
+
+        // Get all station data for this timestamp
+        let rows = sqlx::query(
+            "SELECT station_id, num_bikes_available, num_bikes_available_mechanical, num_bikes_available_ebike,
+                    num_bikes_disabled, num_docks_available, num_docks_disabled, last_reported,
+                    is_charging_station, status, is_installed, is_renting, is_returning, traffic
+             FROM station_status_history WHERE timestamp = ? ORDER BY station_id"
+        )
+        .bind(&timestamp)
+        .fetch_all(&pool)
+        .await?;
+
+        let batch = timestamp_to_record_batch(&timestamp, &rows, &station_ids, &schema)?;
+        writer.write(&batch)?;
+    }
+
+    writer.close()?;
+    info!("Successfully converted database to Parquet: {}", output_path);
+
+    Ok(())
+}
+
+fn create_station_columns_schema(station_ids: &[String]) -> Arc<Schema> {
+    let mut fields = vec![Field::new("timestamp", DataType::Utf8, false)];
+
+    // Add columns for each station's metrics
+    for station_id in station_ids {
+        let prefix = format!("station_{}", station_id);
+
+        fields.push(Field::new(&format!("{}_bikes_available", prefix), DataType::Int32, true));
+        fields.push(Field::new(&format!("{}_bikes_mechanical", prefix), DataType::Int32, true));
+        fields.push(Field::new(&format!("{}_bikes_ebike", prefix), DataType::Int32, true));
+        fields.push(Field::new(&format!("{}_bikes_disabled", prefix), DataType::Int32, true));
+        fields.push(Field::new(&format!("{}_docks_available", prefix), DataType::Int32, true));
+        fields.push(Field::new(&format!("{}_docks_disabled", prefix), DataType::Int32, true));
+        fields.push(Field::new(&format!("{}_last_reported", prefix), DataType::Int64, true));
+        fields.push(Field::new(&format!("{}_is_charging", prefix), DataType::Boolean, true));
+        fields.push(Field::new(&format!("{}_status", prefix), DataType::Utf8, true));
+        fields.push(Field::new(&format!("{}_is_installed", prefix), DataType::Boolean, true));
+        fields.push(Field::new(&format!("{}_is_renting", prefix), DataType::Boolean, true));
+        fields.push(Field::new(&format!("{}_is_returning", prefix), DataType::Boolean, true));
+        fields.push(Field::new(&format!("{}_traffic", prefix), DataType::Int32, true));
+    }
+
+    Arc::new(Schema::new(fields))
+}
+
+#[derive(Debug, Default)]
+struct StationMetrics {
+    bikes_available: Option<i32>,
+    bikes_mechanical: Option<i32>,
+    bikes_ebike: Option<i32>,
+    bikes_disabled: Option<i32>,
+    docks_available: Option<i32>,
+    docks_disabled: Option<i32>,
+    last_reported: Option<i64>,
+    is_charging: Option<bool>,
+    status: Option<String>,
+    is_installed: Option<bool>,
+    is_renting: Option<bool>,
+    is_returning: Option<bool>,
+    traffic: Option<i32>,
+}
+
+fn timestamp_to_record_batch(
+    timestamp: &str,
+    rows: &[sqlx::sqlite::SqliteRow],
+    station_ids: &[String],
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch> {
+    // Create a map of station_id -> StationMetrics for this timestamp
+    let mut station_data_map = std::collections::HashMap::new();
+
+    for row in rows {
+        let station_id: String = row.get("station_id");
+        let data = StationMetrics {
+            bikes_available: Some(row.get("num_bikes_available")),
+            bikes_mechanical: Some(row.get("num_bikes_available_mechanical")),
+            bikes_ebike: Some(row.get("num_bikes_available_ebike")),
+            bikes_disabled: Some(row.get("num_bikes_disabled")),
+            docks_available: Some(row.get("num_docks_available")),
+            docks_disabled: Some(row.get("num_docks_disabled")),
+            last_reported: row.get("last_reported"),
+            is_charging: Some(row.get("is_charging_station")),
+            status: Some(row.get("status")),
+            is_installed: Some(row.get("is_installed")),
+            is_renting: Some(row.get("is_renting")),
+            is_returning: Some(row.get("is_returning")),
+            traffic: row.get("traffic"),
+        };
+        station_data_map.insert(station_id, data);
+    }
+
+    // Create arrays for the record batch
+    let mut arrays: Vec<ArrayRef> = Vec::new();
+
+    // Timestamp column (single value)
+    arrays.push(Arc::new(StringArray::from(vec![timestamp])));
+
+    // Station columns - 13 columns per station
+    for station_id in station_ids {
+        let default_data = StationMetrics::default();
+        let data = station_data_map.get(station_id).unwrap_or(&default_data);
+
+        arrays.push(Arc::new(Int32Array::from(vec![data.bikes_available])));
+        arrays.push(Arc::new(Int32Array::from(vec![data.bikes_mechanical])));
+        arrays.push(Arc::new(Int32Array::from(vec![data.bikes_ebike])));
+        arrays.push(Arc::new(Int32Array::from(vec![data.bikes_disabled])));
+        arrays.push(Arc::new(Int32Array::from(vec![data.docks_available])));
+        arrays.push(Arc::new(Int32Array::from(vec![data.docks_disabled])));
+        arrays.push(Arc::new(Int64Array::from(vec![data.last_reported])));
+        arrays.push(Arc::new(BooleanArray::from(vec![data.is_charging])));
+        arrays.push(Arc::new(StringArray::from(vec![data.status.as_deref()])));
+        arrays.push(Arc::new(BooleanArray::from(vec![data.is_installed])));
+        arrays.push(Arc::new(BooleanArray::from(vec![data.is_renting])));
+        arrays.push(Arc::new(BooleanArray::from(vec![data.is_returning])));
+        arrays.push(Arc::new(Int32Array::from(vec![data.traffic])));
+    }
+
+    Ok(RecordBatch::try_new(schema.clone(), arrays)?)
+}
+
+#[derive(Template)]
+#[template(path = "station_graph.html")]
+struct StationGraphTemplate {
+    station_id: String,
+    data_points: String,
+    hours: u32,
+}
+
+#[derive(Debug)]
+struct DataPoint {
+    timestamp: String,
+    bikes_available: i32,
+}
+
+async fn generate_station_graph(station_id: &str, parquet_file: &str, output_path: &str, hours: u32) -> Result<()> {
+    tracing_subscriber::fmt::init();
+    info!("Generating graph for station {} from Parquet file {}", station_id, parquet_file);
+
+    // Open the Parquet file
+    let file = File::open(parquet_file)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+
+    let station_column = format!("station_{}_bikes_available", station_id);
+
+    let mut data_points = Vec::new();
+    let cutoff_time = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
+
+    // Read all batches and extract data for the specific station
+    for batch_result in reader {
+        let batch = batch_result?;
+
+        // Find timestamp and station column indices
+        let schema = batch.schema();
+        let timestamp_idx = schema.index_of("timestamp")?;
+        let station_idx = match schema.index_of(&station_column) {
+            Ok(idx) => idx,
+            Err(_) => return Err(anyhow::anyhow!("Station {} not found in Parquet file", station_id)),
+        };
+
+        let timestamp_array = batch.column(timestamp_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| anyhow::anyhow!("Timestamp column is not a string array"))?;
+
+        let bikes_array = batch.column(station_idx)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or_else(|| anyhow::anyhow!("Station column is not an int32 array"))?;
+
+        // Process each row in the batch
+        for row_idx in 0..batch.num_rows() {
+            if !bikes_array.is_null(row_idx) {
+                if let Some(timestamp_str) = timestamp_array.value(row_idx).parse::<chrono::DateTime<chrono::Utc>>().ok() {
+                    let bikes_count = bikes_array.value(row_idx);
+
+                    // Filter by time window
+                    if timestamp_str >= cutoff_time {
+                        data_points.push(DataPoint {
+                            timestamp: timestamp_array.value(row_idx).to_string(),
+                            bikes_available: bikes_count,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if data_points.is_empty() {
+        return Err(anyhow::anyhow!("No data found for station {} in the last {} hours", station_id, hours));
+    }
+
+    // Sort by timestamp
+    data_points.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+    info!("Found {} data points for station {}", data_points.len(), station_id);
+
+    // Convert data points to JavaScript array format
+    let js_data_points = data_points
+        .iter()
+        .map(|dp| format!("['{}', {}]", dp.timestamp, dp.bikes_available))
+        .collect::<Vec<_>>()
+        .join(",\n        ");
+
+    let template = StationGraphTemplate {
+        station_id: station_id.to_string(),
+        data_points: js_data_points,
+        hours,
+    };
+
+    let html_content = template.render()?;
+    std::fs::write(output_path, html_content)?;
+
+    info!("Graph generated successfully: {}", output_path);
     Ok(())
 }
 
