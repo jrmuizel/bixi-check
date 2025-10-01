@@ -111,17 +111,24 @@ async fn main() -> Result<()> {
     let client = reqwest::Client::new();
 
     // Main collection loop
-    let mut interval = time::interval(Duration::from_secs(1));
+    let mut next_interval = Duration::from_secs(1); // Start with 1 second, will be updated from TTL
     
     loop {
-        interval.tick().await;
+        // Wait for the appropriate interval
+        time::sleep(next_interval).await;
         
         match collect_and_store_data(&client, &pool).await {
-            Ok(count) => {
+            Ok((count, ttl)) => {
                 info!("Successfully stored {} station records", count);
+                // Update interval based on TTL, with a minimum of 1 second
+                next_interval = Duration::from_secs(ttl.max(1));
+                info!("Next collection in {} seconds", next_interval.as_secs());
             }
             Err(e) => {
                 error!("Failed to collect data: {}", e);
+                // On error, wait a bit before retrying
+                next_interval = Duration::from_secs(5);
+                info!("Retrying in {} seconds", next_interval.as_secs());
             }
         }
     }
@@ -166,7 +173,7 @@ async fn init_database(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
-async fn collect_and_store_data(client: &reqwest::Client, pool: &SqlitePool) -> Result<usize> {
+async fn collect_and_store_data(client: &reqwest::Client, pool: &SqlitePool) -> Result<(usize, u64)> {
     // Fetch data from API
     let response = client.get(API_URL).send().await?;
     
@@ -177,9 +184,10 @@ async fn collect_and_store_data(client: &reqwest::Client, pool: &SqlitePool) -> 
     let station_data: StationStatusResponse = response.json().await?;
     let current_time = Utc::now();
     
-    info!("Fetched data for {} stations at {}", 
+    info!("Fetched data for {} stations at {} (TTL: {} seconds)", 
           station_data.data.stations.len(), 
-          current_time);
+          current_time,
+          station_data.ttl);
 
     // Convert and store each station record
     let mut stored_count = 0;
@@ -211,7 +219,7 @@ async fn collect_and_store_data(client: &reqwest::Client, pool: &SqlitePool) -> 
         }
     }
 
-    Ok(stored_count)
+    Ok((stored_count, station_data.ttl as u64))
 }
 
 async fn store_station_record(pool: &SqlitePool, record: &StationStatusRecord) -> Result<()> {
