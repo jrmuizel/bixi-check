@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqlitePool, sqlite::SqliteConnectOptions, Row};
 use std::time::Duration;
@@ -327,34 +327,54 @@ async fn convert_to_parquet(output_path: &str) -> Result<()> {
     let props = WriterProperties::builder().build();
     let mut writer = ArrowWriter::try_new(output_file, schema.clone(), Some(props))?;
 
-    // Get distinct timestamps to process one timestamp at a time
-    let timestamp_rows = sqlx::query("SELECT DISTINCT last_updated FROM station_status_history ORDER BY last_updated")
-        .fetch_all(&pool)
-        .await?;
+    // Get all data ordered by timestamp
+    let rows = sqlx::query(
+        "SELECT last_updated, station_id, num_bikes_available, num_bikes_available_mechanical, num_bikes_available_ebike,
+                num_bikes_disabled, num_docks_available, num_docks_disabled, last_reported,
+                is_charging_station, status, is_installed, is_renting, is_returning, traffic
+         FROM station_status_history ORDER BY last_updated, station_id"
+    )
+    .fetch_all(&pool)
+    .await?;
 
-    let total_timestamps = timestamp_rows.len();
-    info!("Processing {} unique timestamps", total_timestamps);
+    info!("Processing {} total records", rows.len());
 
-    for (idx, timestamp_row) in timestamp_rows.iter().enumerate() {
-        let timestamp: i64 = timestamp_row.get("last_updated");
+    // Process in batches of timestamps
+    const BATCH_SIZE: usize = 1000;
+    let mut current_batch_timestamps = Vec::new();
+    let mut current_batch_rows = Vec::new();
+    let mut last_timestamp: Option<i64> = None;
+    let mut processed_timestamps = 0;
 
-        if idx % 1000 == 0 {
-            info!("Processing timestamp {} of {} ({})", idx + 1, total_timestamps, timestamp);
+    for row in rows.iter() {
+        let timestamp: i64 = row.get("last_updated");
+
+        // If timestamp changed and we have enough timestamps in batch, write it
+        if let Some(last_ts) = last_timestamp {
+            if timestamp != last_ts {
+                current_batch_timestamps.push(last_ts);
+
+                if current_batch_timestamps.len() >= BATCH_SIZE {
+                    let batch = rows_to_record_batch(&current_batch_rows, &station_ids, &schema)?;
+                    writer.write(&batch)?;
+                    processed_timestamps += current_batch_timestamps.len();
+                    info!("Processed {} timestamps", processed_timestamps);
+                    current_batch_timestamps.clear();
+                    current_batch_rows.clear();
+                }
+            }
         }
 
-        // Get all station data for this timestamp
-        let rows = sqlx::query(
-            "SELECT station_id, num_bikes_available, num_bikes_available_mechanical, num_bikes_available_ebike,
-                    num_bikes_disabled, num_docks_available, num_docks_disabled, last_reported,
-                    is_charging_station, status, is_installed, is_renting, is_returning, traffic
-             FROM station_status_history WHERE last_updated = ? ORDER BY station_id"
-        )
-        .bind(timestamp)
-        .fetch_all(&pool)
-        .await?;
+        current_batch_rows.push(row);
+        last_timestamp = Some(timestamp);
+    }
 
-        let batch = timestamp_to_record_batch(timestamp, &rows, &station_ids, &schema)?;
+    // Write remaining batch
+    if !current_batch_rows.is_empty() {
+        let batch = rows_to_record_batch(&current_batch_rows, &station_ids, &schema)?;
         writer.write(&batch)?;
+        processed_timestamps += current_batch_timestamps.len() + 1;
+        info!("Processed {} timestamps (final batch)", processed_timestamps);
     }
 
     writer.close()?;
@@ -405,17 +425,19 @@ struct StationMetrics {
     traffic: Option<i32>,
 }
 
-fn timestamp_to_record_batch(
-    timestamp: i64,
-    rows: &[sqlx::sqlite::SqliteRow],
+fn rows_to_record_batch(
+    rows: &[&sqlx::sqlite::SqliteRow],
     station_ids: &[String],
     schema: &Arc<Schema>,
 ) -> Result<RecordBatch> {
-    // Create a map of station_id -> StationMetrics for this timestamp
-    let mut station_data_map = std::collections::HashMap::new();
+    // Group rows by timestamp: timestamp -> (station_id -> StationMetrics)
+    let mut timestamp_data: std::collections::BTreeMap<i64, std::collections::HashMap<String, StationMetrics>> =
+        std::collections::BTreeMap::new();
 
     for row in rows {
+        let timestamp: i64 = row.get("last_updated");
         let station_id: String = row.get("station_id");
+
         let data = StationMetrics {
             bikes_available: Some(row.get("num_bikes_available")),
             bikes_mechanical: Some(row.get("num_bikes_available_mechanical")),
@@ -431,33 +453,73 @@ fn timestamp_to_record_batch(
             is_returning: Some(row.get("is_returning")),
             traffic: row.get("traffic"),
         };
-        station_data_map.insert(station_id, data);
+
+        timestamp_data.entry(timestamp)
+            .or_insert_with(std::collections::HashMap::new)
+            .insert(station_id, data);
     }
+
+    let num_rows = timestamp_data.len();
 
     // Create arrays for the record batch
     let mut arrays: Vec<ArrayRef> = Vec::new();
 
-    // Timestamp column (single value)
-    arrays.push(Arc::new(Int64Array::from(vec![timestamp])));
+    // Timestamp column
+    let timestamps: Vec<i64> = timestamp_data.keys().copied().collect();
+    arrays.push(Arc::new(Int64Array::from(timestamps.clone())));
 
     // Station columns - 13 columns per station
-    for station_id in station_ids {
-        let default_data = StationMetrics::default();
-        let data = station_data_map.get(station_id).unwrap_or(&default_data);
+    let default_data = StationMetrics::default();
 
-        arrays.push(Arc::new(Int32Array::from(vec![data.bikes_available])));
-        arrays.push(Arc::new(Int32Array::from(vec![data.bikes_mechanical])));
-        arrays.push(Arc::new(Int32Array::from(vec![data.bikes_ebike])));
-        arrays.push(Arc::new(Int32Array::from(vec![data.bikes_disabled])));
-        arrays.push(Arc::new(Int32Array::from(vec![data.docks_available])));
-        arrays.push(Arc::new(Int32Array::from(vec![data.docks_disabled])));
-        arrays.push(Arc::new(Int64Array::from(vec![data.last_reported])));
-        arrays.push(Arc::new(BooleanArray::from(vec![data.is_charging])));
-        arrays.push(Arc::new(StringArray::from(vec![data.status.as_deref()])));
-        arrays.push(Arc::new(BooleanArray::from(vec![data.is_installed])));
-        arrays.push(Arc::new(BooleanArray::from(vec![data.is_renting])));
-        arrays.push(Arc::new(BooleanArray::from(vec![data.is_returning])));
-        arrays.push(Arc::new(Int32Array::from(vec![data.traffic])));
+    for station_id in station_ids {
+        let mut bikes_available = Vec::with_capacity(num_rows);
+        let mut bikes_mechanical = Vec::with_capacity(num_rows);
+        let mut bikes_ebike = Vec::with_capacity(num_rows);
+        let mut bikes_disabled = Vec::with_capacity(num_rows);
+        let mut docks_available = Vec::with_capacity(num_rows);
+        let mut docks_disabled = Vec::with_capacity(num_rows);
+        let mut last_reported = Vec::with_capacity(num_rows);
+        let mut is_charging = Vec::with_capacity(num_rows);
+        let mut status = Vec::with_capacity(num_rows);
+        let mut is_installed = Vec::with_capacity(num_rows);
+        let mut is_renting = Vec::with_capacity(num_rows);
+        let mut is_returning = Vec::with_capacity(num_rows);
+        let mut traffic = Vec::with_capacity(num_rows);
+
+        for timestamp in &timestamps {
+            let data = timestamp_data
+                .get(timestamp)
+                .and_then(|map| map.get(station_id))
+                .unwrap_or(&default_data);
+
+            bikes_available.push(data.bikes_available);
+            bikes_mechanical.push(data.bikes_mechanical);
+            bikes_ebike.push(data.bikes_ebike);
+            bikes_disabled.push(data.bikes_disabled);
+            docks_available.push(data.docks_available);
+            docks_disabled.push(data.docks_disabled);
+            last_reported.push(data.last_reported);
+            is_charging.push(data.is_charging);
+            status.push(data.status.as_deref());
+            is_installed.push(data.is_installed);
+            is_renting.push(data.is_renting);
+            is_returning.push(data.is_returning);
+            traffic.push(data.traffic);
+        }
+
+        arrays.push(Arc::new(Int32Array::from(bikes_available)));
+        arrays.push(Arc::new(Int32Array::from(bikes_mechanical)));
+        arrays.push(Arc::new(Int32Array::from(bikes_ebike)));
+        arrays.push(Arc::new(Int32Array::from(bikes_disabled)));
+        arrays.push(Arc::new(Int32Array::from(docks_available)));
+        arrays.push(Arc::new(Int32Array::from(docks_disabled)));
+        arrays.push(Arc::new(Int64Array::from(last_reported)));
+        arrays.push(Arc::new(BooleanArray::from(is_charging)));
+        arrays.push(Arc::new(StringArray::from(status)));
+        arrays.push(Arc::new(BooleanArray::from(is_installed)));
+        arrays.push(Arc::new(BooleanArray::from(is_renting)));
+        arrays.push(Arc::new(BooleanArray::from(is_returning)));
+        arrays.push(Arc::new(Int32Array::from(traffic)));
     }
 
     Ok(RecordBatch::try_new(schema.clone(), arrays)?)
