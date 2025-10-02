@@ -58,7 +58,7 @@ struct BikeTypes {
 
 #[derive(Debug, Serialize)]
 struct StationStatusRecord {
-    timestamp: DateTime<Utc>,
+    timestamp: i64,
     station_id: String,
     num_bikes_available: i32,
     num_bikes_available_mechanical: i32,
@@ -187,7 +187,7 @@ async fn init_database(pool: &SqlitePool) -> Result<()> {
         r#"
         CREATE TABLE IF NOT EXISTS station_status_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
+            last_updated INTEGER NOT NULL,
             station_id TEXT NOT NULL,
             num_bikes_available INTEGER NOT NULL,
             num_bikes_available_mechanical INTEGER NOT NULL,
@@ -210,7 +210,7 @@ async fn init_database(pool: &SqlitePool) -> Result<()> {
 
     // Create index for efficient time-series queries
     sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_timestamp_station ON station_status_history (timestamp, station_id)"
+        "CREATE INDEX IF NOT EXISTS idx_timestamp_station ON station_status_history (last_updated, station_id)"
     )
     .execute(pool)
     .await?;
@@ -228,19 +228,19 @@ async fn collect_and_store_data(client: &reqwest::Client, pool: &SqlitePool) -> 
     }
 
     let station_data: StationStatusResponse = response.json().await?;
-    let current_time = Utc::now();
-    
-    info!("Fetched data for {} stations at {} (TTL: {} seconds)", 
-          station_data.data.stations.len(), 
-          current_time,
+    let last_updated = station_data.last_updated;
+
+    info!("Fetched data for {} stations at {} (TTL: {} seconds)",
+          station_data.data.stations.len(),
+          last_updated,
           station_data.ttl);
 
     // Convert and store each station record
     let mut stored_count = 0;
-    
+
     for station in station_data.data.stations {
         let record = StationStatusRecord {
-            timestamp: current_time,
+            timestamp: last_updated,
             station_id: station.station_id,
             num_bikes_available: station.num_bikes_available,
             num_bikes_available_mechanical: station.num_bikes_available_types.mechanical,
@@ -272,14 +272,14 @@ async fn store_station_record(pool: &SqlitePool, record: &StationStatusRecord) -
     sqlx::query(
         r#"
         INSERT INTO station_status_history (
-            timestamp, station_id, num_bikes_available, num_bikes_available_mechanical,
+            last_updated, station_id, num_bikes_available, num_bikes_available_mechanical,
             num_bikes_available_ebike, num_bikes_disabled, num_docks_available,
             num_docks_disabled, last_reported, is_charging_station, status,
             is_installed, is_renting, is_returning, traffic
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
-    .bind(record.timestamp.to_rfc3339())
+    .bind(record.timestamp)
     .bind(&record.station_id)
     .bind(record.num_bikes_available)
     .bind(record.num_bikes_available_mechanical)
@@ -328,7 +328,7 @@ async fn convert_to_parquet(output_path: &str) -> Result<()> {
     let mut writer = ArrowWriter::try_new(output_file, schema.clone(), Some(props))?;
 
     // Get distinct timestamps to process one timestamp at a time
-    let timestamp_rows = sqlx::query("SELECT DISTINCT timestamp FROM station_status_history ORDER BY timestamp")
+    let timestamp_rows = sqlx::query("SELECT DISTINCT last_updated FROM station_status_history ORDER BY last_updated")
         .fetch_all(&pool)
         .await?;
 
@@ -336,7 +336,7 @@ async fn convert_to_parquet(output_path: &str) -> Result<()> {
     info!("Processing {} unique timestamps", total_timestamps);
 
     for (idx, timestamp_row) in timestamp_rows.iter().enumerate() {
-        let timestamp: String = timestamp_row.get("timestamp");
+        let timestamp: i64 = timestamp_row.get("last_updated");
 
         if idx % 1000 == 0 {
             info!("Processing timestamp {} of {} ({})", idx + 1, total_timestamps, timestamp);
@@ -347,13 +347,13 @@ async fn convert_to_parquet(output_path: &str) -> Result<()> {
             "SELECT station_id, num_bikes_available, num_bikes_available_mechanical, num_bikes_available_ebike,
                     num_bikes_disabled, num_docks_available, num_docks_disabled, last_reported,
                     is_charging_station, status, is_installed, is_renting, is_returning, traffic
-             FROM station_status_history WHERE timestamp = ? ORDER BY station_id"
+             FROM station_status_history WHERE last_updated = ? ORDER BY station_id"
         )
-        .bind(&timestamp)
+        .bind(timestamp)
         .fetch_all(&pool)
         .await?;
 
-        let batch = timestamp_to_record_batch(&timestamp, &rows, &station_ids, &schema)?;
+        let batch = timestamp_to_record_batch(timestamp, &rows, &station_ids, &schema)?;
         writer.write(&batch)?;
     }
 
@@ -364,7 +364,7 @@ async fn convert_to_parquet(output_path: &str) -> Result<()> {
 }
 
 fn create_station_columns_schema(station_ids: &[String]) -> Arc<Schema> {
-    let mut fields = vec![Field::new("timestamp", DataType::Utf8, false)];
+    let mut fields = vec![Field::new("last_updated", DataType::Int64, false)];
 
     // Add columns for each station's metrics
     for station_id in station_ids {
@@ -406,7 +406,7 @@ struct StationMetrics {
 }
 
 fn timestamp_to_record_batch(
-    timestamp: &str,
+    timestamp: i64,
     rows: &[sqlx::sqlite::SqliteRow],
     station_ids: &[String],
     schema: &Arc<Schema>,
@@ -438,7 +438,7 @@ fn timestamp_to_record_batch(
     let mut arrays: Vec<ArrayRef> = Vec::new();
 
     // Timestamp column (single value)
-    arrays.push(Arc::new(StringArray::from(vec![timestamp])));
+    arrays.push(Arc::new(Int64Array::from(vec![timestamp])));
 
     // Station columns - 13 columns per station
     for station_id in station_ids {
@@ -497,7 +497,7 @@ async fn generate_station_graph(station_id: &str, parquet_file: &str, output_pat
 
         // Find timestamp and station column indices
         let schema = batch.schema();
-        let timestamp_idx = schema.index_of("timestamp")?;
+        let timestamp_idx = schema.index_of("last_updated")?;
         let station_idx = match schema.index_of(&station_column) {
             Ok(idx) => idx,
             Err(_) => return Err(anyhow::anyhow!("Station {} not found in Parquet file", station_id)),
@@ -505,8 +505,8 @@ async fn generate_station_graph(station_id: &str, parquet_file: &str, output_pat
 
         let timestamp_array = batch.column(timestamp_idx)
             .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| anyhow::anyhow!("Timestamp column is not a string array"))?;
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| anyhow::anyhow!("Timestamp column is not an int64 array"))?;
 
         let bikes_array = batch.column(station_idx)
             .as_any()
@@ -516,13 +516,14 @@ async fn generate_station_graph(station_id: &str, parquet_file: &str, output_pat
         // Process each row in the batch
         for row_idx in 0..batch.num_rows() {
             if !bikes_array.is_null(row_idx) {
-                if let Some(timestamp_str) = timestamp_array.value(row_idx).parse::<chrono::DateTime<chrono::Utc>>().ok() {
+                let timestamp_secs = timestamp_array.value(row_idx);
+                if let Some(timestamp_dt) = DateTime::from_timestamp(timestamp_secs, 0) {
                     let bikes_count = bikes_array.value(row_idx);
 
                     // Filter by time window
-                    if timestamp_str >= cutoff_time {
+                    if timestamp_dt >= cutoff_time {
                         data_points.push(DataPoint {
-                            timestamp: timestamp_array.value(row_idx).to_string(),
+                            timestamp: timestamp_dt.to_rfc3339(),
                             bikes_available: bikes_count,
                         });
                     }
